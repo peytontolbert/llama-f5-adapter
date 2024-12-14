@@ -1,0 +1,12 @@
+*.pt
+*.pkl
+__pycache__/
+*.wav
+voice_profiles/Bob/
+weights/
+checkpoints/
+.env
+F5TTS_Base_vocab.txt
+vocab.txt
+*.json
+data/
