@@ -96,13 +96,9 @@ The adapter uses a transformer-based architecture with:
 
 ## Training
 
-The model is trained using multiple loss components:
-- MSE Loss for basic reconstruction
-- Spectral Convergence Loss
-- Log-magnitude Loss
-- Feature Matching Loss
-- Temporal Consistency Loss
-
+The model is trained using two prediction components:
+- Duration Loss
+- Mel Loss
 ## Acknowledgments
 
 - F5-TTS for the text-to-speech foundation
