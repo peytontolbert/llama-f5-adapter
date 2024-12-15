@@ -15,6 +15,7 @@ from pathlib import Path
 from f5.utils_infer import load_vocoder
 import torchaudio.functional as AF
 import librosa
+from f5.f5tts import F5TTSService
 
 # Configuration
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -324,6 +325,56 @@ def generate_dataset():
         }, f)
     
     print(f"Completed! Total samples in dataset: {len(dataset)}")
+
+def generate_training_data(num_samples=1000):
+    """Generate training data by getting both F5-TTS and LLaMA embeddings"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Initialize models
+    print("Loading F5-TTS...")
+    f5_service = F5TTSService(
+        model_dir="weights",
+        voice_profile="Bob"
+    )
+    
+    print("Loading LLaMA...")
+    llama_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-3b").to(device)
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3b")
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load text dataset
+    dataset = load_dataset("databricks/databricks-dolly-15k", split="train")
+    texts = [item['response'][:150] for item in dataset if len(item['response']) > 50][:num_samples]
+    
+    samples = []
+    print("Generating paired embeddings and mels...")
+    for text in tqdm(texts):
+        try:
+            # Get F5-TTS mel and internal features
+            with torch.no_grad():
+                f5_output = f5_service.model.get_text_embeddings(text)
+                f5_mel = f5_service.model.generate_mel(f5_output)
+                f5_align = f5_service.model.get_alignment_info()
+            
+            # Get LLaMA embeddings
+            inputs = tokenizer(text, return_tensors="pt").to(device)
+            with torch.no_grad():
+                llama_output = llama_model(**inputs, output_hidden_states=True)
+                llama_emb = llama_output.hidden_states[-1].cpu()
+            
+            samples.append({
+                'text': text,
+                'embeddings': llama_emb.squeeze(0),
+                'mel_spec': f5_mel.cpu(),
+                'alignment': f5_align
+            })
+            
+        except Exception as e:
+            print(f"Error processing text: {str(e)}")
+            continue
+            
+    print(f"Generated {len(samples)} samples")
+    return samples
 
 if __name__ == "__main__":
     generate_dataset() 

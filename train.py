@@ -13,14 +13,15 @@ import math
 import json
 from datetime import datetime
 import time
+from analyze_mel import analyze_mel, check_mel_compatibility, plot_mel
 
 # Configuration
 DEVICE = torch.device('cuda:0')
-BATCH_SIZE = 2  # Slightly larger batch for better statistics
+BATCH_SIZE = 32  # Larger batch size
 EPOCHS = 200
-LEARNING_RATE = 0.000005  # Reduced from 0.00001
-WARMUP_STEPS = 500
-GRADIENT_CLIP = 0.01  # Tighter gradient clipping
+LEARNING_RATE = 0.0001
+WARMUP_STEPS = 4000
+GRADIENT_CLIP = 1.0
 CHECKPOINT_DIR = Path("./checkpoints")
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 GRADIENT_ACCUMULATION_STEPS = 32  # More accumulation for stability
@@ -29,10 +30,19 @@ MIN_LR_RATIO = 0.1
 INITIAL_LR_SCALE = 0.1
 DURATION_MIN = 1
 DURATION_MAX = 50
-MEL_LOSS_WEIGHT = 1.0  # Increased from 0.7
-MSE_LOSS_WEIGHT = 0.1  # Reduced from 0.3
-DURATION_LOSS_WEIGHT = 0.005  # Further reduced from 0.01
-WARMUP_EPOCHS = 10  # Longer warmup
+MEL_LOSS_WEIGHT = 1.0
+MSE_LOSS_WEIGHT = 0.2  # Reduced from 0.3
+DURATION_LOSS_WEIGHT = 0.00005  # Significantly reduced
+TEMPORAL_CONSISTENCY_WEIGHT = 0.1  # New weight for temporal variation
+RELATIVE_DURATION_WEIGHT = 0.00001  # Add separate weight for relative loss
+WARMUP_EPOCHS = 5
+CLIP_GRAD_NORM = 1.0
+LR_WARMUP_EPOCHS = 5
+MIN_LR = 1e-6
+BETAS = (0.9, 0.98)
+EPS = 1e-9
+DECAY_EPOCHS = 15
+ACCUM_STEPS = 4  # Effective batch size = batch_size * accum_steps
 
 class AdapterDataset(Dataset):
     def __init__(self, dataset_path):
@@ -79,91 +89,61 @@ class AdapterDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        # Ensure token_durations exists in sample
+        # Ensure token_durations exists in sample and matches embeddings size
         if 'token_durations' not in sample:
             if 'alignment' in sample and 'token_durations' in sample['alignment']:
                 sample['token_durations'] = sample['alignment']['token_durations']
             else:
                 # Create default durations (8 frames per token)
                 sample['token_durations'] = torch.ones(sample['embeddings'].size(0)) * 8
+        
+        # Ensure token_durations matches embeddings size
+        emb_size = sample['embeddings'].size(0)
+        dur_size = sample['token_durations'].size(0)
+        
+        if dur_size < emb_size:
+            # Pad durations if shorter
+            sample['token_durations'] = F.pad(
+                sample['token_durations'],
+                (0, emb_size - dur_size),
+                value=8.0  # Default duration
+            )
+        elif dur_size > emb_size:
+            # Truncate durations if longer
+            sample['token_durations'] = sample['token_durations'][:emb_size]
+        
         return sample
 
 def collate_batch(batch):
-    """Collate function to handle variable length sequences"""
-    # Process each sample, potentially creating multiple chunks
-    chunked_samples = []
+    """Collate function that ensures fixed sequence lengths"""
+    target_len = 32  # Fixed target length for embeddings
+    target_mel_len = target_len * 8  # Fixed mel spectrogram length (8 frames per token)
     
-    for sample in batch:
-        emb_len = sample['embeddings'].size(0)
-        mel_len = sample['mel_spec'].size(-1)
+    # Initialize tensors
+    batch_size = len(batch)
+    embeddings = torch.zeros(batch_size, target_len, batch[0]['embeddings'].size(-1), device=batch[0]['embeddings'].device)
+    mel_specs = torch.zeros(batch_size, batch[0]['mel_spec'].size(0), target_mel_len, device=batch[0]['mel_spec'].device)
+    durations = torch.zeros(batch_size, target_len, device=batch[0]['token_durations'].device)
+    masks = torch.zeros(batch_size, target_len, dtype=torch.bool, device=batch[0]['embeddings'].device)
+    
+    for i, sample in enumerate(batch):
+        # Get original lengths
+        emb_len = min(sample['embeddings'].size(0), target_len)
+        mel_len = min(sample['mel_spec'].size(-1), target_mel_len)
+        dur_len = min(sample['token_durations'].size(0), target_len)
         
-        # If sequence is longer than max length, chunk it
-        max_emb_len = 2048
-        if emb_len > max_emb_len:
-            # Calculate number of chunks needed
-            num_chunks = math.ceil(emb_len / max_emb_len)
-            
-            for i in range(num_chunks):
-                start_idx = i * max_emb_len
-                end_idx = min((i + 1) * max_emb_len, emb_len)
-                mel_start = start_idx * 8  # Approximate mel start
-                mel_end = min(end_idx * 8, mel_len)
-                
-                chunk = {
-                    'embeddings': sample['embeddings'][start_idx:end_idx],
-                    'mel_spec': sample['mel_spec'][..., mel_start:mel_end],
-                    'token_durations': sample['token_durations'][start_idx:end_idx]
-                }
-                chunked_samples.append(chunk)
-        else:
-            chunked_samples.append(sample)
+        # Copy data with proper lengths
+        embeddings[i, :emb_len] = sample['embeddings'][:emb_len]
+        mel_specs[i, :, :mel_len] = sample['mel_spec'][:, :mel_len]
+        durations[i, :dur_len] = sample['token_durations'][:dur_len]
+        masks[i, :emb_len] = True
     
-    # Find max lengths in the chunked samples
-    max_emb_len = max(s['embeddings'].size(0) for s in chunked_samples)
-    max_mel_len = max(s['mel_spec'].size(-1) for s in chunked_samples)
-    
-    # Pad and stack
-    padded_embeddings = []
-    padded_mel_specs = []
-    padded_durations = []
-    
-    for sample in chunked_samples:
-        # Pad embeddings
-        emb_len = sample['embeddings'].size(0)
-        padded_emb = F.pad(
-            sample['embeddings'],
-            (0, 0, 0, max_emb_len - emb_len)
-        )
-        padded_embeddings.append(padded_emb)
-        
-        # Pad mel spectrograms
-        mel_len = sample['mel_spec'].size(-1)
-        padded_mel = F.pad(
-            sample['mel_spec'],
-            (0, max_mel_len - mel_len)
-        )
-        padded_mel_specs.append(padded_mel)
-        
-        # Pad durations
-        dur_len = sample['token_durations'].size(0)
-        padded_dur = F.pad(
-            sample['token_durations'],
-            (0, max_emb_len - dur_len)
-        )
-        padded_durations.append(padded_dur)
-    
-    # Create batch dictionary
-    batch_dict = {
-        'embeddings': torch.stack(padded_embeddings).to(DEVICE),
-        'mel_spec': torch.stack(padded_mel_specs).to(DEVICE),
-        'token_durations': torch.stack(padded_durations).to(DEVICE),
-        'num_chunks': len(chunked_samples) // len(batch),  # Track number of chunks per original sample
-        'is_chunked': len(chunked_samples) > len(batch),
-        'emb_lengths': torch.tensor([s['embeddings'].size(0) for s in chunked_samples]).to(DEVICE),
-        'mel_lengths': torch.tensor([s['mel_spec'].size(-1) for s in chunked_samples]).to(DEVICE)
+    return {
+        'embeddings': embeddings,
+        'mel_spec': mel_specs,
+        'token_durations': durations,
+        'mask': masks
     }
-    
-    return batch_dict
 
 def normalize_mel(mel):
     """Normalize mel spectrogram with robust scaling"""
@@ -200,24 +180,29 @@ def compute_masked_loss(pred, target, mask, loss_fn):
     return normalized_loss + l2_reg
 
 def compute_duration_loss(pred_durations, target_durations, attention_mask):
-    """Compute duration loss with better normalization"""
+    """Compute duration loss with better normalization and scaling"""
     # Get valid elements
     valid_elements = attention_mask.sum() + 1e-8
     
+    # Scale predictions to be in similar range as targets
+    mean_target_duration = (target_durations * attention_mask.float()).sum() / valid_elements
+    scale_factor = mean_target_duration / (pred_durations.mean() + 1e-8)
+    scaled_pred_durations = pred_durations * scale_factor
+    
     # Basic MSE loss on durations with proper masking
     duration_loss = F.mse_loss(
-        pred_durations * attention_mask.float(),
+        scaled_pred_durations * attention_mask.float(),
         target_durations * attention_mask.float(),
         reduction='sum'
     ) / valid_elements
     
-    # Relative duration loss with log-space comparison
-    pred_total = (pred_durations * attention_mask.float()).sum(dim=1) + 1e-8
+    # Relative duration loss with log-space comparison and better normalization
+    pred_total = (scaled_pred_durations * attention_mask.float()).sum(dim=1) + 1e-8
     target_total = (target_durations * attention_mask.float()).sum(dim=1) + 1e-8
     
     relative_loss = F.l1_loss(
-        torch.log(pred_total),
-        torch.log(target_total),
+        torch.log(pred_total / pred_total.mean()),
+        torch.log(target_total / target_total.mean()),
         reduction='mean'
     )
     
@@ -282,8 +267,8 @@ class AdapterTrainer:
                  'weight_decay': 0.0}
             ],
             lr=LEARNING_RATE,
-            betas=(0.9, 0.999),
-            eps=1e-8
+            betas=BETAS,
+            eps=EPS
         )
         
         # More conservative scheduler
@@ -301,8 +286,7 @@ class AdapterTrainer:
         # More conservative EMA
         self.ema = torch.optim.swa_utils.AveragedModel(
             self.adapter,
-            avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: 
-                0.995 * averaged_model_parameter + 0.005 * model_parameter
+            avg_fn=lambda avg, new, num: 0.999 * avg + 0.001 * new
         )
         
         self.scaler = torch.cuda.amp.GradScaler(enabled=True, init_scale=2**10)
@@ -384,13 +368,17 @@ class AdapterTrainer:
         progress = tqdm(self.train_dataloader, desc=f'Epoch {epoch}')
         for batch_idx, batch in enumerate(progress):
             try:
+                # Ensure at least one valid batch
+                if valid_batches == 0:
+                    valid_batches = 1
+                
                 # Get current learning rate scale
                 lr_scale = self.get_lr_scale(epoch, batch_idx)
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = LEARNING_RATE * lr_scale
                 
                 # Create attention mask
-                attention_mask = torch.arange(batch['embeddings'].size(1), device=DEVICE)[None, :] < batch['emb_lengths'][:, None]
+                attention_mask = torch.arange(batch['embeddings'].size(1), device=DEVICE)[None, :] < batch['mask']
                 
                 # Forward pass with duration prediction
                 pred_mel, duration_pred = self.adapter(
@@ -409,7 +397,7 @@ class AdapterTrainer:
                 )
                 
                 # Create mel-level mask
-                mel_mask = torch.arange(batch['mel_spec'].size(-1), device=DEVICE)[None, :] < batch['mel_lengths'][:, None]
+                mel_mask = torch.arange(batch['mel_spec'].size(-1), device=DEVICE)[None, :] < batch['mask']
                 mel_mask = mel_mask.unsqueeze(1).float()
                 
                 # Normalize mels
@@ -434,11 +422,15 @@ class AdapterTrainer:
                     attention_mask
                 )
                 
-                # Combined loss
-                mel_loss = MEL_LOSS_WEIGHT * l1_loss + MSE_LOSS_WEIGHT * mse_loss
-                duration_term = DURATION_LOSS_WEIGHT * (duration_loss + 0.1 * relative_duration_loss)
+                # Combined loss with better balancing
+                weights = self.get_curriculum_weights(epoch)
                 
-                loss = mel_loss + duration_term
+                # Compute losses with curriculum weights
+                mel_loss = weights['mel'] * (MEL_LOSS_WEIGHT * l1_loss + weights['mse'] * MSE_LOSS_WEIGHT * mse_loss)
+                temporal_loss = weights['temporal'] * TEMPORAL_CONSISTENCY_WEIGHT * self.compute_temporal_loss(pred_mel, target_mel, mel_mask)
+                duration_term = weights['duration'] * DURATION_LOSS_WEIGHT * (duration_loss + 0.1 * relative_duration_loss)
+                
+                loss = mel_loss + temporal_loss + duration_term
                 
                 # Clip loss to prevent explosion
                 loss = torch.clamp(loss, max=100.0)
@@ -453,20 +445,28 @@ class AdapterTrainer:
                     loss = loss * lr_scale
                 
                 # Gradient accumulation with scaling
-                loss = loss / GRADIENT_ACCUMULATION_STEPS
+                loss = loss / ACCUM_STEPS
                 self.scaler.scale(loss).backward()
                 
-                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                if (batch_idx + 1) % ACCUM_STEPS == 0:
                     self.scaler.unscale_(self.optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.adapter.parameters(), 
-                        GRADIENT_CLIP * lr_scale
+                        CLIP_GRAD_NORM
                     )
                     
-                    if torch.isfinite(grad_norm):
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        self.ema.update_parameters(self.adapter)
+                    # Adjust learning rate
+                    if epoch < LR_WARMUP_EPOCHS:
+                        lr_scale = min(1.0, epoch / LR_WARMUP_EPOCHS)
+                    else:
+                        lr_scale = max(MIN_LR, 0.5 * (1 + math.cos(math.pi * (epoch - LR_WARMUP_EPOCHS) / (EPOCHS - LR_WARMUP_EPOCHS))))
+                    
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = LEARNING_RATE * lr_scale
+                    
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.ema.update_parameters(self.adapter)
                     
                     self.optimizer.zero_grad()
                 
@@ -486,19 +486,36 @@ class AdapterTrainer:
                     'lr': f"{self.scheduler.get_last_lr()[0]:.6f}"
                 })
                 
+                # Validate mel spectrograms periodically
+                if batch_idx % 100 == 0:
+                    with torch.no_grad():
+                        mel_stats = analyze_mel(pred_mel)
+                        issues = check_mel_compatibility(pred_mel)
+                        if issues:
+                            print("\nMel spectrogram issues detected:")
+                            for issue in issues:
+                                print(f"- {issue}")
+                        
+                        # Optionally visualize
+                        if batch_idx % 1000 == 0:
+                            plot_mel(pred_mel[0], title=f"Epoch {epoch} Batch {batch_idx}")
+                
             except Exception as e:
-                print(f"\nError in batch: {str(e)}")
+                print(f"\nError in batch {batch_idx}: {str(e)}")
+                if valid_batches == 0:
+                    print("No valid batches processed yet. Continuing to next batch...")
                 continue
+        
+        # Protect against division by zero
+        if valid_batches == 0:
+            print("\nNo valid batches in epoch! Returning infinity for loss.")
+            return float('inf')
         
         # Calculate averages
         for k in epoch_losses:
             epoch_losses[k] /= valid_batches
         
-        print(f"\nEpoch {epoch} Component Averages:")
-        for k, v in epoch_losses.items():
-            print(f"Average {k}: {v:.4f}")
-        
-        return total_loss / valid_batches if valid_batches > 0 else float('inf')
+        return total_loss / valid_batches
 
     def combine_chunks(self, chunks, cross_fade_length=256):
         """Combine mel spectrogram chunks with cross-fading"""
@@ -546,7 +563,7 @@ class AdapterTrainer:
             for batch in progress_bar:
                 try:
                     # Create attention mask
-                    attention_mask = torch.arange(batch['embeddings'].size(1), device=DEVICE)[None, :] < batch['emb_lengths'][:, None]
+                    attention_mask = torch.arange(batch['embeddings'].size(1), device=DEVICE)[None, :] < batch['mask']
                     
                     # Forward pass with duration prediction
                     pred_mel, duration_pred = self.ema(
@@ -565,7 +582,7 @@ class AdapterTrainer:
                     )
                     
                     # Create mel-level mask
-                    mel_mask = torch.arange(batch['mel_spec'].size(-1), device=DEVICE)[None, :] < batch['mel_lengths'][:, None]
+                    mel_mask = torch.arange(batch['mel_spec'].size(-1), device=DEVICE)[None, :] < batch['mask']
                     mel_mask = mel_mask.unsqueeze(1).float()
                     
                     # Normalize mels
@@ -591,7 +608,7 @@ class AdapterTrainer:
                     
                     # Combined loss calculation
                     mel_loss = MEL_LOSS_WEIGHT * l1_loss + MSE_LOSS_WEIGHT * mse_loss
-                    duration_term = DURATION_LOSS_WEIGHT * (duration_loss + 0.1 * relative_duration_loss)
+                    duration_term = DURATION_LOSS_WEIGHT * (duration_loss + RELATIVE_DURATION_WEIGHT * relative_duration_loss)
                     total_loss = mel_loss + duration_term
                     
                     # Update running totals
@@ -793,34 +810,27 @@ class AdapterTrainer:
         
         return temp_diff_smoothness + freq_diff_smoothness
 
-    def compute_temporal_consistency_loss(self, pred_mel, target_mel, mel_mask):
-        """Multi-scale temporal consistency loss"""
-        # First-order temporal difference
-        pred_diff1 = pred_mel[..., 1:] - pred_mel[..., :-1]
-        target_diff1 = target_mel[..., 1:] - target_mel[..., :-1]
+    def compute_temporal_consistency_loss(self, pred_mel, target_mel, mask=None):
+        """Compute multi-scale temporal consistency loss"""
+        losses = []
         
-        # Second-order temporal difference (acceleration)
-        pred_diff2 = pred_diff1[..., 1:] - pred_diff1[..., :-1]
-        target_diff2 = target_diff1[..., 1:] - target_diff1[..., :-1]
+        # Temporal difference at multiple scales
+        for scale in [1, 2, 4]:
+            # Compute temporal differences
+            pred_diff = torch.diff(pred_mel, n=scale, dim=2)
+            target_diff = torch.diff(target_mel, n=scale, dim=2)
+            
+            # Adjust mask for difference computation
+            if mask is not None:
+                diff_mask = mask[:, :, scale:]
+                pred_diff = pred_diff * diff_mask
+                target_diff = target_diff * diff_mask
+            
+            # Compute loss at this scale
+            scale_loss = F.l1_loss(pred_diff, target_diff, reduction='mean')
+            losses.append(scale_loss)
         
-        # Adjust mask for differences
-        mask_diff1 = mel_mask[..., 1:]
-        mask_diff2 = mel_mask[..., 2:]
-        
-        # Compute losses at different scales
-        velocity_loss = F.l1_loss(
-            pred_diff1 * mask_diff1,
-            target_diff1 * mask_diff1,
-            reduction='mean'
-        )
-        
-        acceleration_loss = F.l1_loss(
-            pred_diff2 * mask_diff2,
-            target_diff2 * mask_diff2,
-            reduction='mean'
-        )
-        
-        return velocity_loss + 0.5 * acceleration_loss
+        return sum(losses) / len(losses)
 
     def compute_prosody_loss(self, pred_mel, target_mel, mel_mask):
         """Match prosodic features like energy and rhythm"""
@@ -846,42 +856,27 @@ class AdapterTrainer:
         
         return energy_loss + 0.5 * rhythm_loss
 
-    def get_progressive_schedule(self, epoch):
-        """Progressive training schedule with smoother transitions and better balance"""
-        base_schedule = {
-            'mel_weight': 1.0,
-            'spectral_weight': 0.3,
-            'temporal_weight': 0.2,
-            'prosody_weight': 0.2,
-            'duration_weight': 0.3
-        }
-        
-        if epoch < WARMUP_EPOCHS:
-            # Focus on basic reconstruction with higher duration weight
+    def get_progressive_training_config(self, epoch):
+        """Get progressive training configuration"""
+        if epoch < 5:
             return {
                 'mel_weight': 1.0,
-                'spectral_weight': 0.2,
-                'temporal_weight': 0.1,
-                'prosody_weight': 0.1,
-                'duration_weight': 0.5
+                'prosody_weight': 0.0,
+                'discriminator_weight': 0.0,
+                'duration_weight': 0.1
             }
-        elif epoch < 15:
-            # Gradually increase complexity with better balance
-            progress = (epoch - WARMUP_EPOCHS) / (15 - WARMUP_EPOCHS)
+        elif epoch < 10:
             return {
                 'mel_weight': 1.0,
-                'spectral_weight': 0.2 + 0.3 * progress,
-                'temporal_weight': 0.1 + 0.3 * progress,
-                'prosody_weight': 0.1 + 0.3 * progress,
-                'duration_weight': 0.5 - 0.2 * progress
+                'prosody_weight': 0.2,
+                'discriminator_weight': 0.1,
+                'duration_weight': 0.2
             }
         else:
-            # Full complexity with balanced weights
             return {
                 'mel_weight': 1.0,
-                'spectral_weight': 0.5,
-                'temporal_weight': 0.4,
-                'prosody_weight': 0.4,
+                'prosody_weight': 0.5,
+                'discriminator_weight': 0.2,
                 'duration_weight': 0.3
             }
 
@@ -896,8 +891,136 @@ class AdapterTrainer:
         progress = (epoch - WARMUP_EPOCHS) / (EPOCHS - WARMUP_EPOCHS)
         return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
+    def compute_prosody_losses(self, pred_mel, target_mel, mel_mask):
+        """Compute comprehensive prosody losses"""
+        # Energy contour loss
+        pred_energy = torch.norm(pred_mel, dim=1)
+        target_energy = torch.norm(target_mel, dim=1)
+        energy_loss = F.l1_loss(pred_energy * mel_mask.squeeze(1), 
+                               target_energy * mel_mask.squeeze(1))
+        
+        # Pitch contour approximation using autocorrelation
+        pred_pitch = self.compute_autocorr(pred_mel)
+        target_pitch = self.compute_autocorr(target_mel)
+        pitch_loss = F.l1_loss(pred_pitch * mel_mask, target_pitch * mel_mask)
+        
+        # Rhythm/tempo loss using onset strength
+        pred_onsets = self.compute_onset_strength(pred_mel)
+        target_onsets = self.compute_onset_strength(target_mel)
+        rhythm_loss = F.l1_loss(pred_onsets * mel_mask, target_onsets * mel_mask)
+        
+        return {
+            'energy_loss': energy_loss,
+            'pitch_loss': pitch_loss,
+            'rhythm_loss': rhythm_loss
+        }
+
+    def compute_autocorr(self, mel):
+        """Compute autocorrelation for pitch estimation"""
+        pad_len = mel.size(-1) // 2
+        padded = F.pad(mel, (pad_len, pad_len))
+        correlation = F.conv1d(padded, mel.flip(-1))
+        return correlation[..., pad_len:-pad_len]
+
+    def compute_onset_strength(self, mel):
+        """Compute onset strength envelope"""
+        # Temporal difference
+        diff = torch.diff(mel, dim=-1)
+        # Half-wave rectification
+        onset = F.relu(diff)
+        # Smooth with moving average
+        kernel_size = 5
+        onset = F.avg_pool1d(onset, kernel_size, stride=1, padding=kernel_size//2)
+        return onset
+
+    def get_batch_difficulty(self, epoch):
+        """Progressive difficulty scaling"""
+        if epoch < 10:
+            return {
+                'max_length': 32,  # Start with shorter sequences
+                'mel_weight': 1.0,
+                'duration_weight': 0.0001 * min(1.0, epoch/5),  # Gradually introduce duration loss
+                'noise_scale': 0.1 * (1 - epoch/10)  # Reduce noise over time
+            }
+        return {
+            'max_length': None,
+            'mel_weight': 1.0,
+            'duration_weight': 0.0001,
+            'noise_scale': 0.0
+        }
+
+    def get_curriculum_weights(self, epoch):
+        """Progressive curriculum for different loss components"""
+        progress = min(epoch / 10, 1.0)  # Ramp up over 10 epochs
+        return {
+            'mel': 1.0,
+            'mse': 0.2 * progress,
+            'duration': 0.00005 * progress,
+            'temporal': 0.1 * progress
+        }
+
+    def compute_temporal_loss(self, pred_mel, target_mel, mel_mask):
+        """Encourage temporal variation in mel spectrograms"""
+        # Temporal gradients
+        pred_diff = torch.diff(pred_mel, dim=2)
+        target_diff = torch.diff(target_mel, dim=2)
+        
+        # Adjust mask for gradient computation
+        grad_mask = mel_mask[:, :, 1:]
+        
+        # L1 loss on temporal gradients
+        temp_loss = F.l1_loss(
+            pred_diff * grad_mask,
+            target_diff * grad_mask,
+            reduction='mean'
+        )
+        
+        # Additional penalty for static regions
+        static_penalty = torch.exp(-pred_diff.abs().mean(1)).mean()
+        
+        return temp_loss + 0.1 * static_penalty
+
+    def compute_losses(self, pred_mel, target_mel, mask):
+        # L1 loss exactly as F5-TTS
+        l1_loss = F.l1_loss(
+            pred_mel * mask,
+            target_mel * mask,
+            reduction='sum'
+        ) / (mask.sum() + 1e-8)
+        
+        # MSE loss exactly as F5-TTS 
+        mse_loss = F.mse_loss(
+            pred_mel * mask,
+            target_mel * mask,
+            reduction='sum'
+        ) / (mask.sum() + 1e-8)
+        
+        return l1_loss, mse_loss
+
+    def get_lr(self, epoch):
+        if epoch < WARMUP_EPOCHS:
+            return LEARNING_RATE * (epoch / WARMUP_EPOCHS)
+        
+        progress = (epoch - WARMUP_EPOCHS) / DECAY_EPOCHS
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return max(MIN_LR, LEARNING_RATE * cosine_decay)
+
+    def validate_durations(self, pred_dur, target_dur):
+        metrics = {
+            'mean_error': (pred_dur - target_dur).abs().mean(),
+            'std_error': ((pred_dur - target_dur) ** 2).mean().sqrt(),
+            'ratio_error': (
+                torch.log(pred_dur.sum(-1)) - 
+                torch.log(target_dur.sum(-1))
+            ).abs().mean()
+        }
+        return metrics
+
 def compute_f0_correlation(f0_ref, f0_pred):
     """Compute correlation between reference and predicted F0 contours"""
+    if not isinstance(f0_ref, torch.Tensor) or not isinstance(f0_pred, torch.Tensor):
+        return 0.0
+        
     # Remove unvoiced regions (where F0=0)
     mask = (f0_ref > 0) & (f0_pred > 0)
     if not torch.any(mask):
@@ -906,12 +1029,11 @@ def compute_f0_correlation(f0_ref, f0_pred):
     f0_ref = f0_ref[mask]
     f0_pred = f0_pred[mask]
     
-    # Compute Pearson correlation
-    f0_ref = (f0_ref - f0_ref.mean()) / f0_ref.std()
-    f0_pred = (f0_pred - f0_pred.mean()) / f0_pred.std()
-    correlation = torch.mean(f0_ref * f0_pred)
+    # Normalize and compute correlation
+    f0_ref = (f0_ref - f0_ref.mean()) / (f0_ref.std() + 1e-8)
+    f0_pred = (f0_pred - f0_pred.mean()) / (f0_pred.std() + 1e-8)
     
-    return correlation.item()
+    return (f0_ref * f0_pred).mean().item()
 
 def duration_loss(pred_durations, target_durations, target_length=None):
     """Calculate duration loss with optional length matching"""
@@ -925,6 +1047,32 @@ def duration_loss(pred_durations, target_durations, target_length=None):
         loss = loss + length_loss
         
     return loss
+
+def compute_duration_losses(pred_dur, pred_bound, target_dur, mask):
+    # Basic duration loss
+    duration_loss = F.mse_loss(
+        pred_dur * mask,
+        target_dur * mask,
+        reduction='sum'
+    ) / (mask.sum() + 1e-8)
+    
+    # Relative duration loss (ratio between adjacent tokens)
+    pred_ratios = pred_dur[:, 1:] / (pred_dur[:, :-1] + 1e-8)
+    target_ratios = target_dur[:, 1:] / (target_dur[:, :-1] + 1e-8)
+    ratio_loss = F.l1_loss(
+        torch.log(pred_ratios + 1e-8),
+        torch.log(target_ratios + 1e-8)
+    )
+    
+    # Boundary loss to encourage sharp transitions
+    target_bounds = (target_dur > target_dur.mean(dim=1, keepdim=True)).float()
+    boundary_loss = F.binary_cross_entropy(
+        pred_bound,
+        target_bounds,
+        reduction='mean'
+    )
+    
+    return duration_loss, ratio_loss, boundary_loss
 
 def main():
     from adapter.adapter import EnhancedEmbeddingAdapter

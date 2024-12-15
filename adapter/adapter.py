@@ -8,10 +8,60 @@ from f5.modules import (
     AdaLayerNormZero,
     GRN,
     RelativePositionalEmbedding,
-    FeedForward,
-    SinusPositionEmbedding
+    AttnProcessor,
+    Attention
 )
 import math
+from f5.utils import lens_to_mask
+from torch.utils.data import Dataset
+
+def lens_to_mask(lens, length=None):
+    """Convert lengths to mask.
+    
+    Args:
+        lens: [batch_size] tensor of sequence lengths
+        length: optional max length for the mask
+        
+    Returns:
+        [batch_size, max_length] boolean mask
+    """
+    if length is None:
+        length = lens.max()
+    mask = torch.arange(length, device=lens.device)[None, :] < lens[:, None]
+    return mask
+
+class LengthRegulator(nn.Module):
+    def forward(self, x, durations, seq_lengths=None):
+        """
+        Args:
+            x: Input tensor [B, T, C]
+            durations: Duration predictions [B, T]
+            seq_lengths: Valid sequence lengths [B]
+        """
+        if seq_lengths is not None:
+            # Mask durations beyond sequence length
+            mask = torch.arange(durations.size(1), device=durations.device)[None, :] < seq_lengths[:, None]
+            durations = durations * mask.float()
+        
+        # Calculate output lengths
+        output_lengths = torch.round(durations.sum(dim=1)).long()
+        max_len = output_lengths.max()
+        
+        # Regulate lengths
+        output = torch.zeros(
+            x.shape[0], max_len, x.shape[2],
+            device=x.device, dtype=x.dtype
+        )
+        
+        for b in range(x.shape[0]):
+            cur_pos = 0
+            for t in range(seq_lengths[b] if seq_lengths is not None else x.shape[1]):
+                dur = int(durations[b, t].item())
+                if dur > 0:
+                    output[b, cur_pos:cur_pos + dur] = x[b, t]
+                    cur_pos += dur
+        
+        return output
 
 class EnhancedEmbeddingAdapter(nn.Module):
     """
@@ -37,253 +87,221 @@ class EnhancedEmbeddingAdapter(nn.Module):
         print(f"tts_dim: {tts_dim}")
         print(f"n_mel_channels: {n_mel_channels}")
         
-        # Increase dropout for better regularization
-        self.dropout = nn.Dropout(dropout * 2)
-        
-        # Add layer normalization before projection
+        # Pre-norm layers
         self.input_norm = nn.LayerNorm(llama_dim)
+        self.content_norm = nn.LayerNorm(tts_dim)
+        self.prosody_norm = nn.LayerNorm(tts_dim)
         
-        # Add weight decay for regularization
-        self.weight_decay = 0.01
-        
-        # Initial projection with better normalization
+        # Improved input projection with residual
         self.input_proj = nn.Sequential(
-            self.input_norm,
-            nn.Linear(llama_dim, tts_dim),
-            nn.LayerNorm(tts_dim),
-            nn.ReLU(),
-            GRN(tts_dim),
-            self.dropout
+            nn.Linear(llama_dim, tts_dim * 2),
+            nn.GELU(),
+            nn.Linear(tts_dim * 2, tts_dim),
+            nn.LayerNorm(tts_dim)
         )
         
-        # Positional embeddings with consistent dimensions
-        self.pos_embed = ConvPositionEmbedding(tts_dim)
-        self.rel_pos = RelativePositionalEmbedding(
-            dim=tts_dim,
-            num_heads=heads,
-            dim_head=dim_head,
-            max_positions=2048
-        )
-        
-        # Time embedding
-        self.time_embed = TimestepEmbedding(tts_dim)
-        
-        # Main transformer blocks with consistent dimensions
-        self.transformer_blocks = nn.ModuleList([
-            DiTBlock(
-                dim=tts_dim,
-                heads=heads,
-                dim_head=dim_head,  # Pass the same dim_head throughout
-                ff_mult=ff_mult,
-                use_relative_pos=True
-            ) for _ in range(depth)
+        # Text encoder blocks (like F5-TTS)
+        self.encoder_blocks = nn.ModuleList([
+            nn.Sequential(
+                ConvNeXtV2Block(tts_dim, tts_dim*4),
+                AdaLayerNormZero(tts_dim),
+                DiTBlock(tts_dim, heads=8, use_relative_pos=True)
+            ) for _ in range(depth//2)
         ])
         
-        # Final normalization and projection - Remove Sequential
-        self.final_norm = AdaLayerNormZero(tts_dim)  # Change back to AdaLayerNormZero
+        # Add length regulator
+        self.length_regulator = LengthRegulator()
         
-        # Mel spectrogram projection with better range handling
-        self.to_mel = nn.Sequential(
-            FeedForward(tts_dim, tts_dim // 2, dropout=dropout),
-            nn.LayerNorm(tts_dim // 2),
-            nn.GELU(),
-            nn.Linear(tts_dim // 2, n_mel_channels),
-            nn.Tanh()
-        )
-        
-        # Store dimensions for shape checking
-        self.n_mel_channels = n_mel_channels
-        self.tts_dim = tts_dim
-        self.min_seq_len = min_seq_len
-        
-        # Expand hidden states based on predicted durations
-        self.expand_states = nn.Sequential(
-            nn.Linear(tts_dim, tts_dim * 4),
-            nn.LayerNorm(tts_dim * 4),
-            nn.GELU(),
-            nn.Linear(tts_dim * 4, tts_dim)
-        )
-        
-        # Temporal projection
-        self.temporal_proj = nn.Linear(tts_dim, tts_dim)
-        
-        # Single duration predictor with proper architecture
+        # Initialize duration predictor
         self.duration_predictor = DurationPredictor(
             hidden_dim=tts_dim,
             input_dim=llama_dim
         )
         
-        # Separate mel normalizer
-        self.mel_normalizer = MelRangeNormalization(n_mel_channels)
-        
-        # Add sequence length control
-        self.max_duration_per_token = 32
-        self.target_duration_per_token = 24  # F5-TTS average
-        
-        # Refined duration control
-        self.chunk_size = 512
-        self.frames_per_token = 24  # Target F5-TTS average
-        self.min_duration = 8
-        self.max_duration = 32
-        
-        # Add gradient clipping threshold
-        self.grad_clip_thresh = 1.0
-        
-        # Add weight initialization
-        self._init_weights()
-        
-        self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
-        
-    def _init_weights(self):
-        """Initialize weights with better scaling"""
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-        
-        # Special initialization for adapter layers
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                # Use smaller initialization for adapter layers
-                m.weight.data.normal_(mean=0.0, std=0.02)
-                if m.bias is not None:
-                    m.bias.data.zero_()
-    
-    def predict_chunk_durations(self, chunk, target_length=None):
-        """Predict and adjust durations for a chunk of tokens"""
-        # Get initial duration predictions
-        duration_pred = self.duration_predictor(chunk)  # [B, T, 1]
-        durations = duration_pred.squeeze(-1)  # [B, T]
-        
-        # If no target length specified, use frames_per_token average
-        if target_length is None:
-            target_length = chunk.size(1) * self.frames_per_token
-            
-        # Scale durations to match target length while preserving relative durations
-        for b in range(durations.size(0)):
-            current_sum = durations[b].sum()
-            scale = target_length / current_sum
-            durations[b] = (durations[b] * scale).round()
-            
-            # Clamp individual durations
-            durations[b] = durations[b].clamp(min=self.min_duration, max=self.max_duration)
-            
-            # Fine-tune to exactly match target length
-            current_sum = durations[b].sum()
-            diff = target_length - current_sum
-            
-            if diff > 0:
-                # Add frames to shortest durations
-                for _ in range(int(diff)):
-                    idx = durations[b].argmin()
-                    if durations[b, idx] < self.max_duration:
-                        durations[b, idx] += 1
-            elif diff < 0:
-                # Remove frames from longest durations
-                for _ in range(int(-diff)):
-                    idx = durations[b].argmax()
-                    if durations[b, idx] > self.min_duration:
-                        durations[b, idx] -= 1
-        
-        return durations.long()
-    
-    def forward(self, llama_embeddings, timesteps, mask=None, return_features=False, ref_audio_len=None, ref_text=None, speed=1.0, return_durations=False):
-        """Process embeddings similar to F5-TTS text processing"""
-        # Ensure inputs are on correct device
-        device = llama_embeddings.device
-        if timesteps.device != device:
-            timesteps = timesteps.to(device)
-        if mask is not None and mask.device != device:
-            mask = mask.to(device)
-        
-        batch_size = llama_embeddings.shape[0]
-        
-        # Project embeddings
-        projected_embeddings = self.input_proj(llama_embeddings)  # [B, T, tts_dim]
-        
-        # Duration prediction and scaling
-        duration_pred = self.duration_predictor(llama_embeddings)
-        durations = (duration_pred.squeeze(-1) * speed).round().long()
-        durations = durations.clamp(min=self.min_duration, max=self.max_duration)
-        
-        # Calculate max length after expansion
-        max_expanded_len = max([
-            sum([int(durations[b, t].item()) for t in range(llama_embeddings.size(1))
-                if mask is None or mask[b, t]])
-            for b in range(batch_size)
+        # Then use it in variance adaptor
+        self.variance_adaptor = nn.ModuleList([
+            ConvNeXtV2Block(tts_dim, tts_dim*4),
+            AdaLayerNormZero(tts_dim),
+            self.duration_predictor
         ])
         
-        # Expand states based on predicted durations with padding
-        expanded_sequences = []
-        for b in range(batch_size):
-            expanded_seq = []
-            current_len = 0
-            
-            for t in range(llama_embeddings.size(1)):
-                if mask is None or mask[b, t]:
-                    feat = self.expand_states(projected_embeddings[b, t])
-                    dur = int(durations[b, t].item())
-                    expanded = feat.unsqueeze(0).expand(dur, -1)
-                    expanded_seq.append(expanded)
-                    current_len += dur
-            
-            # Concatenate and pad if necessary
-            expanded_seq = torch.cat(expanded_seq, dim=0)  # [L, D]
-            if current_len < max_expanded_len:
-                # Create padding tensor on same device as expanded_seq
-                padding = torch.zeros(
-                    max_expanded_len - current_len, 
-                    self.tts_dim, 
-                    device=device  # Use input device
-                )
-                expanded_seq = torch.cat([expanded_seq, padding], dim=0)
-            
-            expanded_sequences.append(expanded_seq)
+        # Decoder blocks (F5-TTS style)
+        self.decoder_blocks = nn.ModuleList([
+            nn.Sequential(
+                ConvNeXtV2Block(tts_dim, tts_dim*4),
+                AdaLayerNormZero(tts_dim),
+                DiTBlock(tts_dim, heads=8)
+            ) for _ in range(depth//2)
+        ])
         
-        hidden_states = torch.stack(expanded_sequences, dim=0)  # [B, T_mel, tts_dim]
+        # Output layers
+        self.final_norm = nn.LayerNorm(tts_dim)
+        self.to_mel = nn.Linear(tts_dim, n_mel_channels)
         
-        # Better feature mixing
-        x = self.pos_embed(hidden_states)
-        rel_pos = self.rel_pos(x)  # Store relative position embeddings
-        if rel_pos is not None:
-            x = x + self.dropout(rel_pos)
+        # Add prosody encoder
+        self.prosody_encoder = ProsodyEncoder(tts_dim)
         
+        # Add time embedding layer
+        self.time_embed = TimestepEmbedding(
+            dim=tts_dim
+        )
+        
+        # Add mel range normalization
+        self.mel_range_norm = MelRangeNormalization(n_mel_channels)
+        
+        # Add dropout and layer norm
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = nn.LayerNorm(tts_dim)
+        
+        # Add F5-TTS style position encoding
+        self.rel_pos = RelativePositionalEmbedding(
+            dim=tts_dim,
+            num_heads=heads,
+            max_positions=2048
+        )
+        self.conv_pos = ConvPositionEmbedding(tts_dim)
+        
+        # Add temporal attention
+        self.temporal_attn = nn.MultiheadAttention(
+            tts_dim, 
+            heads, 
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        # Add temporal variation modules
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(tts_dim, tts_dim, 3, padding=1, groups=tts_dim),
+            nn.ReLU(),
+            nn.Conv1d(tts_dim, tts_dim, 3, padding=1, groups=tts_dim)
+        )
+        
+        # Reference encoder for style matching
+        self.ref_style_encoder = nn.Sequential(
+            nn.Conv1d(n_mel_channels, tts_dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(tts_dim),
+            nn.Conv1d(tts_dim, tts_dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(tts_dim)
+        )
+        
+        # Rest of your initialization code...
+        self.target_len = 32  # Add fixed target length
+
+    def forward(self, llama_embeddings, timesteps, mask=None, return_durations=False, ref_audio=None, ref_text=None):
         # Get time embeddings
         time_emb = self.time_embed(timesteps)
         
-        # Layer-wise feature normalization
-        layer_norms = []
-        for i in range(len(self.transformer_blocks)):
-            layer_norms.append(nn.LayerNorm(self.tts_dim).to(x.device))
+        # Ensure input has target length of 32
+        if llama_embeddings.size(1) != self.target_len:
+            llama_embeddings = F.interpolate(
+                llama_embeddings.transpose(1, 2),
+                size=self.target_len,
+                mode='nearest'
+            ).transpose(1, 2)
         
-        # Create mel-level mask based on expanded sequence lengths
-        mel_mask = None
+        # Encode reference style if available
+        ref_style = None
+        if ref_audio is not None:
+            ref_style = self.ref_style_encoder(ref_audio.transpose(1, 2))
+            ref_style = ref_style.transpose(1, 2)
+            
+            # Ensure reference matches target length
+            if ref_style.size(1) != self.target_len:
+                ref_style = F.interpolate(
+                    ref_style.transpose(1, 2),
+                    size=self.target_len,
+                    mode='nearest'
+                ).transpose(1, 2)
+        
+        # Text encoding
+        x = self.input_proj(llama_embeddings)
+        
+        # Ensure mask matches target length
         if mask is not None:
-            mel_lengths = [
-                sum([int(durations[b, t].item()) for t in range(llama_embeddings.size(1))
-                    if mask[b, t]])
-                for b in range(batch_size)
-            ]
-            mel_mask = torch.arange(max_expanded_len, device=x.device)[None, :] < torch.tensor(mel_lengths, device=x.device)[:, None]
+            if mask.size(1) != self.target_len:
+                mask = F.interpolate(
+                    mask.float().unsqueeze(1),
+                    size=self.target_len,
+                    mode='nearest'
+                ).squeeze(1).bool()
         
-        # Process through transformer blocks with relative positions and mask
-        for i, block in enumerate(self.transformer_blocks):
-            x = block(x, time_emb, rel_pos=rel_pos, mask=mel_mask)
-            x = layer_norms[i](x)
+        # Process through encoder blocks
+        for block in self.encoder_blocks:
+            # Apply temporal convolution with length preservation
+            x_temp = x.transpose(1, 2)  # [B, C, T]
+            x_temp = self.temporal_conv(x_temp)  # [B, C, T] - Length preserved due to padding
+            x_temp = x_temp.transpose(1, 2)  # [B, T, C]
+            
+            # Create attention masks
+            if mask is not None:
+                if len(mask.shape) == 3:
+                    mask = mask.squeeze(1)
+                attn_mask = mask.unsqueeze(1).expand(-1, mask.size(1), -1)
+                attn_mask = attn_mask.repeat(self.temporal_attn.num_heads, 1, 1)
+            else:
+                attn_mask = None
+            
+            # Apply temporal attention
+            temporal_out = self.temporal_attn(
+                x,  # [batch, 32, dim]
+                x_temp,  # [batch, 32, dim] - Now guaranteed same length as x
+                x_temp,  # [batch, 32, dim]
+                attn_mask=attn_mask,
+                need_weights=False
+            )[0]
+            
+            # Controlled residual connection
+            x = x + 0.1 * temporal_out
+            
+            # Regular block processing
+            conv_out = block[0](x)
+            norm_out, _, _ = block[1](conv_out, time_emb)
+            x = block[2](norm_out, time_emb, mask=mask)
         
-        # Final normalization and mel projection
-        x, scale, shift = self.final_norm(x, time_emb)
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        # Get durations with proper masking
+        durations = self.duration_predictor(x, ref_audio, ref_text, mask=mask)
         
-        # Generate mel spectrogram
-        mel_output = self.to_mel(x)  # [B, T, n_mel_channels]
-        mel_output = mel_output.transpose(1, 2)  # [B, n_mel_channels, T]
+        # Apply mask to durations if provided
+        if mask is not None:
+            durations = durations * mask.float()
         
-        # Apply mel range normalization
-        mel_output = self.mel_normalizer(mel_output)
+        # Length regulation with safety checks
+        try:
+            # Get valid sequence lengths from mask
+            if mask is not None:
+                seq_lengths = mask.sum(dim=1)
+            else:
+                seq_lengths = torch.full((x.shape[0],), x.shape[1], device=x.device)
+            
+            # Apply length regulation
+            x = self.length_regulator(x, durations, seq_lengths)
+        except Exception as e:
+            print(f"Length regulation error: {str(e)}")
+            # Fallback to simple upsampling
+            target_len = int(durations.sum(dim=1).max().item())
+            x = F.interpolate(
+                x.transpose(1, 2),
+                size=target_len,
+                mode='linear',
+                align_corners=False
+            ).transpose(1, 2)
+        
+        # Process through decoder blocks
+        for block in self.decoder_blocks:
+            conv_out = block[0](x)
+            norm_out, _, _ = block[1](conv_out, time_emb)
+            x = block[2](norm_out, time_emb)
+        
+        # Generate mel with gradient clipping
+        mel = self.to_mel(x)
+        mel = torch.clamp(mel, min=-100, max=100)  # Prevent extreme values
+        mel = mel.transpose(1, 2)
         
         if return_durations:
-            return mel_output, duration_pred
-        return mel_output
+            return mel, durations
+        return mel
 
     def adjust_model(self, convergence_metrics):
         """Adjust model based on convergence analysis"""
@@ -298,106 +316,176 @@ class EnhancedEmbeddingAdapter(nn.Module):
 class MelRangeNormalization(nn.Module):
     def __init__(self, n_mel_channels):
         super().__init__()
-        self.register_buffer('target_min', torch.tensor(-6.0))
-        self.register_buffer('target_max', torch.tensor(6.0))
-        self.register_buffer('target_mean', torch.tensor(-0.86))
-        self.register_buffer('target_std', torch.tensor(2.5))
+        self.register_buffer('target_min', torch.tensor(-12.0))
+        self.register_buffer('target_max', torch.tensor(2.0))
         
-        # Add learnable scaling factors
+        # Learnable scaling parameters per channel
         self.scale = nn.Parameter(torch.ones(1, n_mel_channels, 1))
         self.bias = nn.Parameter(torch.zeros(1, n_mel_channels, 1))
+        self.range_scale = nn.Parameter(torch.ones(1))
         
-    def forward(self, x):
-        # Normalize to zero mean and unit variance
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True) + 1e-5
-        x = (x - mean) / std
+    def forward(self, mel):
+        # Dynamic range adjustment
+        mel = mel * self.scale + self.bias
         
-        # Apply learnable scaling
-        x = x * self.scale + self.bias
+        # Scale to target range
+        mel = torch.tanh(mel * self.range_scale)
+        mel = mel * (self.target_max - self.target_min)/2 + (self.target_max + self.target_min)/2
         
-        # Scale to target distribution
-        x = x * self.target_std + self.target_mean
-        
-        # Clip to target range
-        x = torch.clamp(x, self.target_min, self.target_max)
-        return x
+        return mel
 
 class DurationPredictor(nn.Module):
     def __init__(self, hidden_dim, input_dim=3072):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.target_len = 32  # Add fixed target length
         
-        # Replace fixed positional embedding with sinusoidal
-        self.register_buffer(
-            'position_ids',
-            torch.arange(2048).expand((1, -1))  # Increased max length
+        # Bi-directional LSTM for sequence modeling
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim//2,
+            num_layers=2,
+            bidirectional=True,
+            dropout=0.1,
+            batch_first=True
         )
         
-        # Use the RelativePositionalEmbedding from f5.modules
-        self.rel_pos = RelativePositionalEmbedding(
-            dim=hidden_dim,
-            num_heads=1,  # Single head for duration prediction
-            dim_head=hidden_dim,
-            max_positions=2048
+        # Reference encoder with attention
+        self.ref_encoder = nn.Sequential(
+            nn.Conv1d(100, hidden_dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(0.1),
+            nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim)
         )
         
-        self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1)
-        self.norm3 = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(0.1)
-        self.proj = nn.Linear(hidden_dim, 1)
+        # Multi-head attention for aligning with reference
+        self.ref_attention = nn.MultiheadAttention(
+            hidden_dim, 
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
+        )
         
-        # Add sinusoidal position encoding
-        self.pos_encoding = SinusPositionEmbedding(hidden_dim)
+        # Duration predictor network
+        self.duration_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()
+        )
         
-    def forward(self, x):
-        # x: [B, T, H]
-        batch_size, seq_len = x.shape[:2]
+        # Variance predictor for temporal variation
+        self.variance_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+            nn.Tanh()
+        )
         
-        # Project input
-        x = self.input_proj(x)
-        x = self.norm1(x)
+    def forward(self, x, ref_audio=None, ref_text=None, mask=None):
+        # Ensure input has target length
+        if x.size(1) != self.target_len:
+            x = F.interpolate(
+                x.transpose(1, 2),
+                size=self.target_len,
+                mode='nearest'
+            ).transpose(1, 2)
         
-        # Add sinusoidal positional embeddings
-        positions = torch.arange(seq_len, device=x.device).float()
-        pos_emb = self.pos_encoding(positions)  # [T, H]
-        x = x + pos_emb.unsqueeze(0)  # Add to batch dimension
+        # Process through LSTM
+        x_lstm, _ = self.lstm(x)
         
-        # Get relative positional bias
-        rel_pos = self.rel_pos(x)  # [B, H, T, T]
-        
-        # Handle case where rel_pos is None
-        if rel_pos is not None:
-            # Extract diagonal elements for position-wise features
-            rel_pos_diag = torch.diagonal(rel_pos, dim1=-2, dim2=-1)  # [B, H, T]
-            rel_pos_features = rel_pos_diag.permute(0, 2, 1)  # [B, T, H]
+        # Process reference if available
+        if ref_audio is not None:
+            # Encode reference mel
+            ref_features = self.ref_encoder(ref_audio.transpose(1, 2))
+            ref_features = ref_features.transpose(1, 2)
             
-            # Project relative position features to match hidden dimension
-            rel_pos_features = F.linear(
-                rel_pos_features,
-                torch.eye(x.shape[-1], device=x.device)[:rel_pos_features.shape[-1]]
-            )
+            # Ensure reference has target length
+            if ref_features.size(1) != self.target_len:
+                ref_features = F.interpolate(
+                    ref_features.transpose(1, 2),
+                    size=self.target_len,
+                    mode='nearest'
+                ).transpose(1, 2)
             
-            x = x + rel_pos_features
+            # Create attention mask
+            if mask is not None:
+                if len(mask.shape) == 3:
+                    mask = mask.squeeze(1)
+                
+                # Create fixed size attention mask
+                attn_mask = torch.zeros(
+                    (x.shape[0], self.target_len, self.target_len),
+                    device=x.device,
+                    dtype=torch.bool
+                )
+                
+                # Fill valid positions
+                for i in range(x.shape[0]):
+                    valid_len = min(mask[i].sum().item(), self.target_len)
+                    attn_mask[i, :valid_len, :valid_len] = True
+            else:
+                attn_mask = None
+            
+            # Attend to reference
+            attn_output = self.ref_attention(
+                x_lstm,
+                ref_features,
+                ref_features,
+                attn_mask=attn_mask,
+                need_weights=False
+            )[0]
+            
+            x_combined = torch.cat([x_lstm, attn_output], dim=-1)
+        else:
+            x_combined = torch.cat([x_lstm, torch.zeros_like(x_lstm)], dim=-1)
         
-        x = self.dropout(x)
+        # Predict durations
+        durations = self.duration_net(x_combined)
         
-        # Convolutional processing
-        x_conv = x.transpose(1, 2)  # [B, H, T]
-        x_conv = F.relu(self.conv1(x_conv))
-        x_conv = x_conv.transpose(1, 2)  # [B, T, H]
-        x_conv = self.norm2(x_conv)
+        # Predict variance
+        variance = self.variance_net(x_lstm)
+        variance = torch.clamp(variance, min=-0.5, max=0.5)
         
-        x_conv = x_conv.transpose(1, 2)  # [B, H, T]
-        x_conv = F.relu(self.conv2(x_conv))
-        x_conv = x_conv.transpose(1, 2)  # [B, T, H]
-        x_conv = self.norm3(x_conv)
+        # Apply variance to durations
+        durations = durations * (1.0 + 0.05 * variance)
         
-        # Final projection with positive output
-        durations = F.softplus(self.proj(x_conv))  # [B, T, 1]
+        # Ensure positive durations
+        durations = F.softplus(durations) + 1e-6
+        
+        # Apply mask if provided
+        if mask is not None:
+            # Ensure mask has target length
+            if mask.size(1) != self.target_len:
+                mask = F.interpolate(
+                    mask.float().unsqueeze(1),
+                    size=self.target_len,
+                    mode='nearest'
+                ).squeeze(1).bool()
+            durations = durations * mask.float()
+        
+        return durations.squeeze(-1)
+
+    def infer_durations(self, x, ref_audio=None, ref_text=None, mask=None, speed=1.0):
+        """Special inference mode with speed control"""
+        durations = self.forward(x, ref_audio, ref_text, mask)
+        
+        # Apply speed factor
+        durations = durations / speed
+        
+        # Quantize to integer number of frames
+        durations = torch.round(durations)
+        
+        # Ensure minimum duration
+        durations = torch.clamp(durations, min=1)
+        
         return durations
 
 class CosineWarmupScheduler:
@@ -419,3 +507,236 @@ class CosineWarmupScheduler:
             
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = param_group['initial_lr'] * lr_scale
+
+class MelDiscriminator(nn.Module):
+    def __init__(self, n_mel_channels):
+        super().__init__()
+        
+        # Multi-scale discriminators
+        self.discriminators = nn.ModuleList([
+            self._make_discriminator(n_mel_channels, scale) 
+            for scale in [1, 2, 4]  # Different scales for analysis
+        ])
+        
+    def _make_discriminator(self, channels, scale):
+        return nn.Sequential(
+            nn.Conv2d(1, 32 * scale, kernel_size=(7, 7), stride=(2, 2), padding=3),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32 * scale, 64 * scale, kernel_size=(5, 5), stride=(2, 2), padding=2),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64 * scale, 128 * scale, kernel_size=(3, 3), stride=(2, 2), padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128 * scale, 1, kernel_size=(3, 3), padding=1)
+        )
+    
+    def forward(self, mel):
+        # Add channel dimension
+        mel = mel.unsqueeze(1)  # [B, 1, M, T]
+        
+        # Get discriminator outputs at different scales
+        outputs = []
+        for disc in self.discriminators:
+            outputs.append(disc(mel))
+            
+        return outputs
+
+class ProsodyEncoder(nn.Module):
+    def __init__(self, tts_dim):
+        super().__init__()
+        
+        self.energy_encoder = nn.Sequential(
+            nn.Conv1d(1, tts_dim//4, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(tts_dim//4, tts_dim//2, 3, padding=1),
+            nn.ReLU()
+        )
+        
+        self.pitch_encoder = nn.Sequential(
+            nn.Conv1d(1, tts_dim//4, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(tts_dim//4, tts_dim//2, 3, padding=1),
+            nn.ReLU()
+        )
+        
+        self.combine = nn.Linear(tts_dim, tts_dim)
+        
+    def forward(self, mel):
+        # Extract energy and pitch features
+        energy = torch.norm(mel, dim=1, keepdim=True)
+        energy_features = self.energy_encoder(energy)
+        
+        # Approximate pitch using autocorrelation
+        pitch = self.compute_pitch(mel)
+        pitch_features = self.pitch_encoder(pitch)
+        
+        # Combine features
+        prosody = torch.cat([energy_features, pitch_features], dim=1)
+        return self.combine(prosody.transpose(1, 2))
+
+class VarianceAdaptor(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.duration_predictor = DurationPredictor(dim)
+        self.pitch_predictor = PitchPredictor(dim) 
+        self.energy_predictor = EnergyPredictor(dim)
+        self.length_regulator = LengthRegulator()
+
+class F5AttentionBlock(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.attn = Attention(
+            processor=AttnProcessor(),
+            dim=dim,
+            heads=heads,
+            use_relative_pos=True
+        )
+        self.norm = AdaLayerNormZero(dim)
+
+class MelDecoder(nn.Module):
+    def __init__(self, dim, n_mel_channels):
+        super().__init__()
+        self.prenet = nn.Sequential(
+            ConvNeXtV2Block(dim, dim*4),
+            ConvNeXtV2Block(dim, dim*4),
+            ConvNeXtV2Block(dim, dim*4)
+        )
+        self.postnet = nn.Conv1d(dim, n_mel_channels, 1)
+
+class ConvNeXtV2Block(nn.Module):
+    def __init__(self, dim, ff_dim):
+        super().__init__()
+        # Increase receptive field
+        self.dwconv = nn.Sequential(
+            nn.Conv1d(dim, dim, 5, padding=2, groups=dim),
+            nn.GELU(),
+            nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.pwconv1 = nn.Linear(dim, ff_dim)
+        self.act = nn.GELU()
+        self.grn = GRN(ff_dim)
+        self.pwconv2 = nn.Linear(ff_dim, dim)
+        
+    def forward(self, x):
+        residual = x
+        
+        # Add temporal attention
+        if x.size(1) >= 4:
+            x = x.transpose(1, 2)
+            x = self.dwconv(x)
+            x = x.transpose(1, 2)
+            
+            # Add temporal mixing
+            x = x + 0.1 * torch.roll(x, shifts=1, dims=1)
+        
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.grn(x)
+        x = self.pwconv2(x)
+        return residual + x
+
+class PitchPredictor(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(dim, dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(dim),
+            nn.Conv1d(dim, dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(dim),
+            nn.Linear(dim, 1)
+        )
+        
+    def forward(self, x):
+        # x: [B, T, D]
+        x = x.transpose(1, 2)  # [B, D, T]
+        x = self.net(x)
+        return x.transpose(1, 2)  # [B, T, 1]
+
+class EnergyPredictor(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(dim, dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(dim),
+            nn.Conv1d(dim, dim, 3, padding=1),
+            nn.ReLU(),
+            nn.LayerNorm(dim),
+            nn.Linear(dim, 1)
+        )
+        
+    def forward(self, x):
+        # x: [B, T, D]
+        x = x.transpose(1, 2)  # [B, D, T]
+        x = self.net(x)
+        return x.transpose(1, 2)  # [B, T, 1]
+
+class AdapterDataset(Dataset):
+    def __init__(self, samples):
+        self.samples = samples
+        
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        return {
+            'embeddings': sample['embeddings'],
+            'mel_spec': sample['mel_spec'],
+            'token_durations': sample['token_durations']
+        }
+
+def collate_batch(batch):
+    """Collate function that ensures fixed sequence lengths"""
+    # Get max lengths with upper bound
+    max_emb_len = min(max(s['embeddings'].size(0) for s in batch), 32)  # Cap at 32
+    max_mel_len = max(s['mel_spec'].size(-1) for s in batch)
+    
+    # Pad sequences
+    padded_samples = []
+    for sample in batch:
+        # Handle embeddings
+        embeddings = sample['embeddings']
+        if embeddings.size(0) > max_emb_len:
+            # Truncate if too long
+            embeddings = embeddings[:max_emb_len]
+        else:
+            # Pad if too short
+            emb_pad = max_emb_len - embeddings.size(0)
+            embeddings = F.pad(embeddings, (0, 0, 0, emb_pad))
+        
+        # Handle mel spectrograms
+        mel_spec = sample['mel_spec']
+        mel_pad = max_mel_len - mel_spec.size(-1)
+        mel_spec = F.pad(mel_spec, (0, mel_pad))
+        
+        # Handle durations
+        durations = sample['token_durations']
+        if durations.size(0) > max_emb_len:
+            durations = durations[:max_emb_len]
+        else:
+            durations = F.pad(durations, (0, max_emb_len - durations.size(0)))
+        
+        # Create mask
+        mask = torch.ones(max_emb_len, dtype=torch.bool, device=embeddings.device)
+        mask[min(sample['embeddings'].size(0), max_emb_len):] = False
+        
+        padded_samples.append({
+            'embeddings': embeddings,
+            'mel_spec': mel_spec,
+            'token_durations': durations,
+            'mask': mask
+        })
+    
+    # Stack into tensors
+    batch_dict = {
+        'embeddings': torch.stack([s['embeddings'] for s in padded_samples]),
+        'mel_spec': torch.stack([s['mel_spec'] for s in padded_samples]),
+        'token_durations': torch.stack([s['token_durations'] for s in padded_samples]),
+        'mask': torch.stack([s['mask'] for s in padded_samples])
+    }
+    
+    return batch_dict

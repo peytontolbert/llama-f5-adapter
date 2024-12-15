@@ -151,7 +151,7 @@ def main():
     ).to(device)
     
     # Load trained adapter weights
-    checkpoint = torch.load("checkpoints/adapter_epoch_3.pt", map_location=device)
+    checkpoint = torch.load("checkpoints/adapter_epoch_122.pt", map_location=device)
     adapter.load_state_dict(checkpoint['model_state_dict'])
     adapter.eval()
     
