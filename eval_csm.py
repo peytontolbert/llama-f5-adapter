@@ -41,37 +41,19 @@ class CSMEvaluator:
             # Add batch dimension
             embeddings = llama_embeddings.unsqueeze(0).to(self.device)
             
-            # Generate mel spectrogram
-            mel = self.adapter(
+            # Generate mel spectrogram and durations
+            mel, durations = self.adapter(
                 embeddings,
                 timesteps=torch.zeros(1, device=self.device),
-                mask=torch.ones(1, embeddings.size(1), dtype=torch.bool, device=self.device)
+                mask=torch.ones(1, embeddings.size(1), dtype=torch.bool, device=self.device),
+                return_durations=True
             )
             
-            print(f"Initial mel shape: {mel.shape}")
+            # Expand mel spectrogram based on durations for consistent mel length
+            mel = self.adapter.expand_mel(mel, durations)
             
-            # Handle potential 4D output and ensure contiguous memory
-            if len(mel.shape) == 4:
-                mel = mel.contiguous().view(mel.size(0), mel.size(1), -1)
-            
-            # Ensure mel has shape [B x n_mels x T]
-            if mel.size(1) != 100:
-                mel = mel.transpose(1, 2).contiguous()
-            
-            # Normalize mel spectrogram
-            mel = 2 * (mel - mel.min()) / (mel.max() - mel.min() + 1e-8) - 1
-            
-            print("\nVocoder info:")
-            print(f"Vocoder type: {type(self.vocoder)}")
-            print(f"Feature extractor type: {type(self.vocoder.feature_extractor)}")
-            
+            # Proceed with vocoder processing
             try:
-                # Try using mel spectrogram directly
-                print(f"\nProcessed mel shape before vocoder: {mel.shape}")
-                
-                # Keep in [B x n_mels x T] format for vocoder
-                print(f"Mel shape for vocoder: {mel.shape}")
-                
                 # Generate audio using vocoder's decode method
                 audio = self.vocoder.decode(mel)
                 
@@ -101,16 +83,16 @@ class CSMEvaluator:
                         print("Trying final approach...")
                         
                         # Use raw mel input with channel adjustment
-                        mel = mel.squeeze(0)  # [n_mels x T]
+                        mel = mel.squeeze(0)  # [n_mel x T]
                         if mel.size(0) != 100:
                             mel = F.interpolate(
-                                mel.unsqueeze(0),  # [1 x n_mels x T]
+                                mel.unsqueeze(0),  # [1 x n_mel x T]
                                 size=(100, mel.size(-1)),
                                 mode='bilinear',
                                 align_corners=False
                             )
-                        mel = mel.squeeze(0)  # [n_mels x T]
-                        mel = mel.unsqueeze(0)  # [1 x n_mels x T]
+                        mel = mel.squeeze(0)  # [n_mel x T]
+                        mel = mel.unsqueeze(0)  # [1 x n_mel x T]
                         
                         print(f"Final mel shape: {mel.shape}")
                         
@@ -120,20 +102,20 @@ class CSMEvaluator:
                     except Exception as e3:
                         print(f"All attempts failed: {str(e3)}")
                         # Return silence with correct length
-                        audio = torch.zeros(1, int(mel.size(-1) * 256))
-                
-                # Scale audio back to original length if needed
-                target_length = int(llama_embeddings.size(0) * 256)
-                if audio is not None and audio.size(-1) != target_length:
-                    audio = F.interpolate(
-                        audio.unsqueeze(1),
-                        size=target_length,
-                        mode='linear',
-                        align_corners=False
-                    ).squeeze(1)
-                
-                if save_path and audio is not None:
-                    torchaudio.save(save_path, audio.cpu(), 24000)
+                        audio = torch.zeros(1, int(durations.sum().item() * 256))
+                    
+                    # Scale audio back to original length if needed
+                    target_length = int(llama_embeddings.size(0) * 256)
+                    if audio is not None and audio.size(-1) != target_length:
+                        audio = F.interpolate(
+                            audio.unsqueeze(1),
+                            size=target_length,
+                            mode='linear',
+                            align_corners=False
+                        ).squeeze(1)
+                    
+                    if save_path and audio is not None:
+                        torchaudio.save(save_path, audio.cpu(), 24000)
 
         return audio.squeeze().cpu(), 24000 if audio is not None else (None, None)
         
@@ -161,62 +143,73 @@ class CSMEvaluator:
             print("Evaluating samples...")
             for i, sample in enumerate(tqdm(dataset)):
                 try:
-                    # Generate mel spectrogram
                     with torch.no_grad():
                         seq_len = sample['embeddings'].size(0)
+                        
+                        # Create proper attention mask
+                        attention_mask = torch.ones(1, seq_len, dtype=torch.bool, device=self.device)
                         
                         pred_mel, pred_durations = self.adapter(
                             sample['embeddings'].unsqueeze(0).to(self.device),
                             timesteps=torch.zeros(1, device=self.device),
-                            mask=torch.ones(1, seq_len, dtype=torch.bool, device=self.device),
+                            mask=attention_mask,
                             return_durations=True
                         )
                         
-                        # Handle potential 4D output
-                        if len(pred_mel.shape) == 4:
-                            pred_mel = pred_mel.squeeze(2)
+                        # Expand target mel using ground truth durations if available
+                        if 'alignment' in sample and 'token_durations' in sample['alignment']:
+                            target_durations = sample['alignment']['token_durations'].unsqueeze(0).to(self.device)
+                            expanded_target = self.adapter.expand_mel(
+                                sample['mel_spec'].unsqueeze(0).to(self.device),
+                                target_durations
+                            )
+                        else:
+                            expanded_target = sample['mel_spec'].unsqueeze(0).to(self.device)
                         
-                        # Interpolate to match target length
-                        pred_mel = F.interpolate(
-                            pred_mel,
-                            size=sample['mel_spec'].size(-1),
-                            mode='linear',
-                            align_corners=False
+                        # Ensure pred_mel and expanded_target have the same length
+                        if pred_mel.size(-1) != expanded_target.size(-1):
+                            target_length = max(pred_mel.size(-1), expanded_target.size(-1))
+                            if pred_mel.size(-1) < target_length:
+                                pred_mel = F.interpolate(
+                                    pred_mel,
+                                    size=target_length,
+                                    mode='nearest'
+                                )
+                            else:
+                                expanded_target = F.interpolate(
+                                    expanded_target,
+                                    size=target_length,
+                                    mode='nearest'
+                                )
+                        
+                        # Compute metrics with expanded sequences
+                        metrics['mel_l1'].append(F.l1_loss(pred_mel, expanded_target).item())
+                        metrics['mel_l2'].append(F.mse_loss(pred_mel, expanded_target).item())
+                        
+                        # Compute duration error if available
+                        if 'alignment' in sample and 'token_durations' in sample['alignment']:
+                            target_durations = sample['alignment']['token_durations'].to(self.device)
+                            min_len = min(pred_durations.size(1), len(target_durations))
+                            pred_dur = pred_durations.squeeze(0)[:min_len]
+                            target_dur = target_durations[:min_len]
+                            metrics['duration_error'].append(F.l1_loss(pred_dur, target_dur).item())
+                        
+                        # Generate and save audio
+                        audio, sr = self.generate_audio(sample['embeddings'])
+                        torchaudio.save(
+                            output_dir / f"sample_{i}.wav",
+                            audio.unsqueeze(0),
+                            sr
                         )
-                    
-                    # Print shapes for debugging
-                    print(f"\nSample {i}:")
-                    print(f"pred_mel shape: {pred_mel.shape}")
-                    print(f"target_mel shape: {sample['mel_spec'].shape}")
-                    
-                    # Compute mel metrics
-                    metrics['mel_l1'].append(F.l1_loss(pred_mel, sample['mel_spec'].unsqueeze(0).to(self.device)).item())
-                    metrics['mel_l2'].append(F.mse_loss(pred_mel, sample['mel_spec'].unsqueeze(0).to(self.device)).item())
-                    
-                    # Compute duration error if available
-                    if 'alignment' in sample and 'token_durations' in sample['alignment']:
-                        target_durations = sample['alignment']['token_durations'].to(self.device)
-                        min_len = min(pred_durations.size(1), len(target_durations))
-                        pred_dur = pred_durations.squeeze(0)[:min_len]
-                        target_dur = target_durations[:min_len]
-                        metrics['duration_error'].append(F.l1_loss(pred_dur, target_dur).item())
-                    
-                    # Generate and save audio
-                    audio, sr = self.generate_audio(sample['embeddings'])
-                    torchaudio.save(
-                        output_dir / f"sample_{i}.wav",
-                        audio.unsqueeze(0),
-                        sr
-                    )
-                    
-                    # Save mel spectrograms for comparison
-                    np.save(output_dir / f"pred_mel_{i}.npy", pred_mel.cpu().numpy())
-                    np.save(output_dir / f"target_mel_{i}.npy", sample['mel_spec'].cpu().numpy())
-                    
-                    # Save durations for comparison
-                    if 'alignment' in sample and 'token_durations' in sample['alignment']:
-                        np.save(output_dir / f"pred_durations_{i}.npy", pred_durations.cpu().numpy())
-                        np.save(output_dir / f"target_durations_{i}.npy", target_durations.cpu().numpy())
+                        
+                        # Save mel spectrograms for comparison
+                        np.save(output_dir / f"pred_mel_{i}.npy", pred_mel.cpu().numpy())
+                        np.save(output_dir / f"target_mel_{i}.npy", sample['mel_spec'].cpu().numpy())
+                        
+                        # Save durations for comparison
+                        if 'alignment' in sample and 'token_durations' in sample['alignment']:
+                            np.save(output_dir / f"pred_durations_{i}.npy", pred_durations.cpu().numpy())
+                            np.save(output_dir / f"target_durations_{i}.npy", target_durations.cpu().numpy())
                         
                 except Exception as e:
                     print(f"\nError processing sample {i}: {str(e)}")

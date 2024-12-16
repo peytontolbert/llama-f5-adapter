@@ -166,13 +166,17 @@ class CSMAdapter(nn.Module):
         self.final_norm = nn.LayerNorm(tts_dim)
         self.to_mel = nn.Linear(tts_dim, n_mel_channels)
         
-        # Duration predictor
+        # Duration predictor with better stability
         self.duration_predictor = nn.Sequential(
+            nn.LayerNorm(tts_dim),
             nn.Linear(tts_dim, tts_dim // 2),
+            nn.LayerNorm(tts_dim // 2),
             nn.ReLU(),
             nn.Linear(tts_dim // 2, 1),
             nn.Softplus()
         )
+        
+        self.duration_loss_scale = 0.1  # Add duration loss scale parameter
         
     def forward(self, llama_embeddings, timesteps, mask=None, return_durations=False):
         """
@@ -183,9 +187,15 @@ class CSMAdapter(nn.Module):
             mask: Attention mask [B x T]
             return_durations: Whether to return duration predictions
         Returns:
-            mel_spec: Generated mel spectrogram [B x n_mel x T]
+            mel_spec: Generated mel spectrogram [B x n_mel x T_expanded]
             durations: (optional) Duration predictions [B x T]
         """
+        # Handle default masking
+        if mask is None:
+            mask = torch.ones(llama_embeddings.shape[:2], dtype=torch.bool, device=llama_embeddings.device)
+        else:
+            mask = mask.bool()
+        
         # Get time embeddings
         time_emb = self.time_embed(timesteps)
         
@@ -194,43 +204,40 @@ class CSMAdapter(nn.Module):
         # First do regular projection
         x = self.input_proj(llama_embeddings)  # [B x T x tts_dim]
         
+        # Predict durations early to influence mel spectrogram generation
+        durations = self.duration_predictor(x).squeeze(-1)  # [B x T]
+        
+        # Expand embeddings based on predicted durations
+        x, expanded_mask = self.expand_embeddings(x, durations, mask)  # [B x T_expanded x tts_dim], [B x T_expanded]
+        
         # Apply CSM fusion for each position in sequence
         fused_features = []
-        for t in range(seq_len):
-            
+        for t in range(x.size(1)):
             fused_t = self.csm_fusion(
                 x[:, t],  # [B x tts_dim]
                 self.input_proj.weight  # [tts_dim x llama_dim]
             )  # [B x tts_dim]
-            
-            
             fused_features.append(fused_t)
         
-        # Stack fused features along sequence dimension
-        x = torch.stack(fused_features, dim=1)  # [B x T x tts_dim]
-        # Verify dimensions
-        assert x.shape == (batch_size, seq_len, self.tts_dim), f"Expected shape {(batch_size, seq_len, self.tts_dim)}, got {x.shape}"
+        x = torch.stack(fused_features, dim=1)  # [B x T_expanded x tts_dim]
         
         # Add positional encoding
-        x = self.pos_embedding(x)  # [B x T x tts_dim]
+        x = self.pos_embedding(x)  # [B x T_expanded x tts_dim]
         
         # Process through blocks
         for block in self.blocks:
             # Apply layer norm with time embedding
             normed, _, _ = block['norm'](x, time_emb)
             
-            # Apply DiT block
-            x = block['dit'](normed, time_emb, mask=mask)
+            # Apply DiT block with expanded mask
+            x = block['dit'](normed, time_emb, mask=expanded_mask)
         
         # Final processing
         x = self.final_norm(x)
         
-        # Predict durations
-        durations = self.duration_predictor(x).squeeze(-1)  # [B x T]
-        
-        # Generate mel spectrogram
-        mel = self.to_mel(x)  # [B x T x n_mel]
-        mel = mel.transpose(1, 2)  # [B x n_mel x T]
+        # Generate mel spectrogram after processing
+        mel = self.to_mel(x)  # [B x T_expanded x n_mel]
+        mel = mel.transpose(1, 2)  # [B x n_mel x T_expanded]
         
         if return_durations:
             return mel, durations
@@ -248,3 +255,103 @@ class CSMAdapter(nn.Module):
         # Update canonical transforms
         self.csm_fusion.P.copy_(U)
         self.csm_fusion.Q.copy_(Vt.T) 
+
+    def expand_embeddings(self, x, durations, mask=None):
+        """
+        Expand embeddings and masks based on predicted durations.
+        Similar to original F5-TTS masking but adapted for duration-based expansion.
+        """
+        B, T, C = x.size()
+        expanded = []
+        expanded_masks = []
+        
+        # Clamp and prepare durations
+        durations = torch.clamp(durations, min=1).long()  # [B x T]
+        expanded_lengths = durations.sum(dim=-1)  # [B]
+        max_len = expanded_lengths.max().item()
+        
+        # Create position indices for mask creation (similar to original lens_to_mask)
+        pos_indices = torch.arange(max_len, device=x.device)[None, :]  # [1 x max_len]  # Not used!
+        
+        for b in range(B):
+            emb_b = x[b]  # [T x C]
+            dur_b = durations[b]  # [T]
+            emb_expanded_b = emb_b.repeat_interleave(dur_b, dim=0)  # [T_expanded x C]
+            
+            # Pad to max_len
+            pad_len = max_len - emb_expanded_b.size(0)
+            if pad_len > 0:
+                pad = torch.zeros(pad_len, C, device=x.device)
+                emb_expanded_b = torch.cat([emb_expanded_b, pad], dim=0)
+            expanded.append(emb_expanded_b)
+            
+            if mask is not None:
+                mask_b = mask[b]  # [T]
+                # Create cumulative duration indices for masking
+                dur_cumsum = torch.cumsum(dur_b, dim=0)  # [T]
+                dur_cumsum_prev = torch.cat([torch.zeros(1, device=x.device), dur_cumsum[:-1]])  # [T]
+                
+                # Create expanded mask using position-based logic
+                mask_expanded_b = torch.zeros(max_len, dtype=torch.bool, device=mask.device)
+                for t, (start, end) in enumerate(zip(dur_cumsum_prev, dur_cumsum)):
+                    if mask_b[t]:  # Only expand valid positions
+                        mask_expanded_b[int(start):int(end)] = True
+                expanded_masks.append(mask_expanded_b)
+        
+        expanded_x = torch.stack(expanded, dim=0)  # [B x max_len x tts_dim]
+        expanded_mask = torch.stack(expanded_masks, dim=0) if mask is not None else None  # [B x max_len]
+        
+        # Validate expanded mask (similar to original F5-TTS validation)
+        if expanded_mask is not None:
+            assert expanded_mask.dtype == torch.bool, f"Expected bool mask, got {expanded_mask.dtype}"
+            assert expanded_mask.shape == (B, max_len), f"Expected mask shape {(B, max_len)}, got {expanded_mask.shape}"
+            assert expanded_mask.sum(dim=1).min() > 0, "Found sequence with no valid positions"
+        
+        return expanded_x, expanded_mask
+
+    def expand_mel(self, mel_spec, token_durations):
+        """
+        Expand mel spectrogram based on token durations.
+        Args:
+            mel_spec: Target mel spectrogram [B x n_mel x T]
+            token_durations: Ground truth durations [B x T_tokens]
+        Returns:
+            Expanded mel spectrogram [B x n_mel x T_expanded]
+        """
+        B, n_mel, T = mel_spec.shape
+        durations = token_durations.int()
+        
+        # Handle duration length mismatch
+        if durations.size(1) > T:
+            durations = durations[:, :T]
+        elif durations.size(1) < T:
+            pad_size = T - durations.size(1)
+            duration_pad = torch.ones(B, pad_size, device=durations.device, dtype=durations.dtype)
+            durations = torch.cat([durations, duration_pad], dim=1)
+        
+        # Ensure no zero durations
+        durations = torch.clamp(durations, min=1)
+        
+        mel_expanded = []
+        for b in range(B):
+            mel_b = mel_spec[b]  # [n_mel x T]
+            dur_b = durations[b]  # [T]
+            mel_expanded_b = mel_b.repeat_interleave(dur_b, dim=1)  # [n_mel x T_expanded]
+            mel_expanded.append(mel_expanded_b)
+        
+        # Find maximum length for padding
+        max_len = max([mel.size(1) for mel in mel_expanded])
+        
+        # Pad each expanded mel to max length
+        padded_mels = []
+        for mel in mel_expanded:
+            if mel.size(1) < max_len:
+                pad_size = max_len - mel.size(1)
+                pad = torch.zeros(n_mel, pad_size, device=mel.device)
+                mel_padded = torch.cat([mel, pad], dim=1)
+            else:
+                mel_padded = mel
+            padded_mels.append(mel_padded)
+        
+        mel_expanded = torch.stack(padded_mels, dim=0)  # [B x n_mel x T_expanded]
+        return mel_expanded

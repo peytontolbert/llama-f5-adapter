@@ -15,12 +15,14 @@ class CSMTrainer:
         learning_rate=1e-4,
         batch_size=32,
         num_epochs=100,
+        duration_loss_scale=0.1,
         device='cuda'
     ):
         self.adapter = adapter.to(device)
         self.device = device
         self.batch_size = batch_size
         self.num_epochs = num_epochs
+        self.duration_loss_scale = duration_loss_scale
         
         # Create dataloaders
         self.train_loader = DataLoader(
@@ -45,12 +47,14 @@ class CSMTrainer:
              'lr': learning_rate}
         ])
         
+        # Calculate total steps
+        total_steps = num_epochs * len(self.train_loader)
+        
         # Use OneCycleLR for better convergence
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=learning_rate,
-            epochs=num_epochs,
-            steps_per_epoch=len(self.train_loader),
+            total_steps=total_steps,
             pct_start=0.1,  # Shorter warmup
             div_factor=25,  # Lower starting LR
             final_div_factor=1000,
@@ -127,8 +131,33 @@ class CSMTrainer:
                     return_durations=True
                 )
                 
+                # Expand target mel spectrogram based on ground truth durations
+                expanded_mel = self.adapter.expand_mel(batch['mel_spec'], batch['token_durations'])
+                
+                # Debug prints
+                print(f"pred_mel shape: {pred_mel.shape}")
+                print(f"expanded_mel shape: {expanded_mel.shape}")
+                print(f"mask shape: {batch['mask'].shape}")
+                
+                # Ensure pred_mel and expanded_mel have the same time dimension
+                if pred_mel.size(-1) != expanded_mel.size(-1):
+                    # Interpolate the shorter one to match the longer one
+                    target_length = max(pred_mel.size(-1), expanded_mel.size(-1))
+                    if pred_mel.size(-1) < target_length:
+                        pred_mel = F.interpolate(
+                            pred_mel,
+                            size=target_length,
+                            mode='nearest'
+                        )
+                    else:
+                        expanded_mel = F.interpolate(
+                            expanded_mel,
+                            size=target_length,
+                            mode='nearest'
+                        )
+                
                 # Compute losses
-                mel_loss = self.compute_mel_loss(pred_mel, batch['mel_spec'], batch['mask'])
+                mel_loss = self.compute_mel_loss(pred_mel, expanded_mel, batch['mask'])
                 duration_loss = self.duration_loss_scale * self.compute_duration_loss(
                     pred_durations,
                     batch['token_durations'],
@@ -175,36 +204,59 @@ class CSMTrainer:
         return avg_loss
     
     def compute_mel_loss(self, pred_mel, target_mel, mask):
-        """Compute mel spectrogram loss with masking and better normalization"""
-        # Normalize mel specs to [-1, 1] range
+        """Updated mel loss computation for expanded sequences"""
+        # Debug shapes
+        print(f"Initial shapes - pred_mel: {pred_mel.shape}, target_mel: {target_mel.shape}, mask: {mask.shape}")
+        
+        # Ensure pred_mel and target_mel have the same time dimension
+        if pred_mel.size(-1) != target_mel.size(-1):
+            # Interpolate the shorter one to match the longer one
+            target_length = max(pred_mel.size(-1), target_mel.size(-1))
+            if pred_mel.size(-1) < target_length:
+                pred_mel = F.interpolate(
+                    pred_mel,
+                    size=target_length,
+                    mode='nearest'
+                )
+            else:
+                target_mel = F.interpolate(
+                    target_mel,
+                    size=target_length,
+                    mode='nearest'
+                )
+        
+        # Normalize mel specs
         pred_mel = 2 * (pred_mel - pred_mel.min()) / (pred_mel.max() - pred_mel.min() + 1e-8) - 1
         target_mel = 2 * (target_mel - target_mel.min()) / (target_mel.max() - target_mel.min() + 1e-8) - 1
         
-        # Create mel mask
-        mel_len = min(pred_mel.size(-1), target_mel.size(-1))
-        token_len = mask.size(-1)
+        # Get target length for mask interpolation
+        target_length = pred_mel.size(-1)
         
-        # Interpolate mask to mel length
+        # Create mel mask by expanding attention mask
         mel_mask = F.interpolate(
-            mask.unsqueeze(1).float(),
-            size=mel_len,
+            mask.float().unsqueeze(1),
+            size=target_length,
             mode='nearest'
         )
         
-        # Truncate to same length
-        pred_mel = pred_mel[..., :mel_len]
-        target_mel = target_mel[..., :mel_len]
+        # Debug shapes after processing
+        print(f"After processing - pred_mel: {pred_mel.shape}, target_mel: {target_mel.shape}, mel_mask: {mel_mask.shape}")
         
-        # L1 loss with better normalization
-        l1_loss = (torch.abs(pred_mel - target_mel) * mel_mask).sum() / (mel_mask.sum() + 1e-8)
+        # Ensure all tensors have compatible shapes
+        assert pred_mel.size(-1) == target_mel.size(-1) == mel_mask.size(-1), \
+            f"Shape mismatch: pred_mel={pred_mel.shape}, target_mel={target_mel.shape}, mel_mask={mel_mask.shape}"
         
-        # MSE loss with better normalization
-        mse_loss = (torch.pow(pred_mel - target_mel, 2) * mel_mask).sum() / (mel_mask.sum() + 1e-8)
+        # Ensure broadcasting works correctly
+        mel_mask = mel_mask.expand_as(pred_mel)
         
-        # Add spectral convergence loss
-        spec_loss = self.spectral_convergence_loss(pred_mel, target_mel, mel_mask)
+        # Compute masked losses
+        l1_loss = torch.abs(pred_mel - target_mel) * mel_mask
+        l1_loss = l1_loss.sum() / (mel_mask.sum() + 1e-8)
         
-        return self.mel_loss_scale * (l1_loss + 0.1 * mse_loss + 0.1 * spec_loss)
+        mse_loss = torch.pow(pred_mel - target_mel, 2) * mel_mask
+        mse_loss = mse_loss.sum() / (mel_mask.sum() + 1e-8)
+        
+        return l1_loss + 0.1 * mse_loss
     
     def spectral_convergence_loss(self, pred_mel, target_mel, mask):
         """Compute spectral convergence loss"""
@@ -214,24 +266,24 @@ class CSMTrainer:
         return torch.norm(torch.abs(target_fft) - torch.abs(pred_fft), p='fro') / (torch.norm(torch.abs(target_fft), p='fro') + 1e-8)
     
     def compute_duration_loss(self, pred_durations, target_durations, mask):
-        """Compute duration prediction loss"""
-        # Basic MSE loss
+        """Enhanced duration loss computation"""
+        # Ensure durations are positive
+        pred_durations = F.softplus(pred_durations)
+        target_durations = target_durations.float()
+        
+        # Compute loss only on masked positions
         duration_loss = F.mse_loss(
             pred_durations * mask.float(),
             target_durations * mask.float(),
             reduction='sum'
         ) / (mask.sum() + 1e-8)
         
-        # Relative duration loss
-        pred_total = (pred_durations * mask.float()).sum(dim=1) + 1e-8
-        target_total = (target_durations * mask.float()).sum(dim=1) + 1e-8
+        # Add length regularization
+        pred_lengths = (pred_durations * mask.float()).sum(dim=1)
+        target_lengths = (target_durations * mask.float()).sum(dim=1)
+        length_loss = F.l1_loss(pred_lengths, target_lengths)
         
-        relative_loss = F.l1_loss(
-            torch.log(pred_total / pred_total.mean()),
-            torch.log(target_total / target_total.mean())
-        )
-        
-        return duration_loss + 0.1 * relative_loss
+        return duration_loss + 0.1 * length_loss
     
     def validate(self):
         """Validate model on validation set"""
@@ -243,7 +295,6 @@ class CSMTrainer:
         
         with torch.no_grad():
             for batch in self.val_loader:
-                # Forward pass
                 pred_mel, pred_durations = self.ema(
                     batch['embeddings'],
                     timesteps=torch.zeros(len(batch['embeddings']), device=self.device),
@@ -251,16 +302,11 @@ class CSMTrainer:
                     return_durations=True
                 )
                 
-                # Interpolate predicted mel
-                pred_mel = F.interpolate(
-                    pred_mel,
-                    size=batch['mel_spec'].size(-1),
-                    mode='linear',
-                    align_corners=False
-                )
+                # Expand target mel using ground truth durations
+                expanded_mel = self.adapter.expand_mel(batch['mel_spec'], batch['token_durations'])
                 
                 # Compute losses
-                mel_loss = self.compute_mel_loss(pred_mel, batch['mel_spec'], batch['mask'])
+                mel_loss = self.compute_mel_loss(pred_mel, expanded_mel, batch['mask'])
                 duration_loss = self.compute_duration_loss(
                     pred_durations,
                     batch['token_durations'],
